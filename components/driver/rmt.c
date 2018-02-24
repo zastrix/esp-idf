@@ -45,6 +45,7 @@
 #define RMT_CLK_DIV_ERROR_STR     "RMT CLK DIV ERR"
 #define RMT_DRIVER_ERROR_STR      "RMT DRIVER ERR"
 #define RMT_DRIVER_LENGTH_ERROR_STR  "RMT PARAM LEN ERROR"
+#define RMT_TRANSLATOR_UNINIT_STR  "RMT translator not init"
 
 static const char* RMT_TAG = "rmt";
 static uint8_t s_rmt_driver_channels; // Bitmask (bits 0-7) of installed drivers' channels
@@ -66,11 +67,14 @@ typedef struct {
     int tx_offset;
     int tx_len_rem;
     int tx_sub_len;
+    bool translator;
     rmt_channel_t channel;
     const rmt_item32_t* tx_data;
     xSemaphoreHandle tx_sem;
-    RingbufHandle_t tx_buf;
+    xSemaphoreHandle tx_thr_sem;
+    rmt_item32_t* tx_buf;
     RingbufHandle_t rx_buf;
+    sample_to_rmt_t sample_to_rmt;
 } rmt_obj_t;
 
 rmt_obj_t* p_rmt_obj[RMT_CHANNEL_MAX] = {0};
@@ -617,6 +621,11 @@ static void IRAM_ATTR rmt_driver_isr_default(void* arg)
                     } else {
                         p_rmt->tx_offset = 0;
                     }
+                    if(p_rmt->tx_len_rem == 0) {
+                        if(p_rmt->translator) {
+                            xSemaphoreGiveFromISR(p_rmt->tx_thr_sem, &HPTaskAwoken);
+                        }
+                    }
                 }
             }
         }
@@ -656,9 +665,20 @@ esp_err_t rmt_driver_uninstall(rmt_channel_t channel)
         vSemaphoreDelete(p_rmt_obj[channel]->tx_sem);
         p_rmt_obj[channel]->tx_sem = NULL;
     }
+    if(p_rmt_obj[channel]->tx_thr_sem) {
+        vSemaphoreDelete(p_rmt_obj[channel]->tx_thr_sem);
+        p_rmt_obj[channel]->tx_thr_sem = NULL;
+    }
     if(p_rmt_obj[channel]->rx_buf) {
         vRingbufferDelete(p_rmt_obj[channel]->rx_buf);
         p_rmt_obj[channel]->rx_buf = NULL;
+    }
+    if(p_rmt_obj[channel]->tx_buf) {
+        free(p_rmt_obj[channel]->tx_buf);
+        p_rmt_obj[channel]->tx_buf = NULL;
+    }
+    if(p_rmt_obj[channel]->sample_to_rmt) {
+        p_rmt_obj[channel]->sample_to_rmt = NULL;
     }
 
     free(p_rmt_obj[channel]);
@@ -691,7 +711,8 @@ esp_err_t rmt_driver_install(rmt_channel_t channel, size_t rx_buf_size, int intr
     p_rmt_obj[channel]->channel = channel;
     p_rmt_obj[channel]->tx_offset = 0;
     p_rmt_obj[channel]->tx_sub_len = 0;
-
+    p_rmt_obj[channel]->translator = false;
+    p_rmt_obj[channel]->sample_to_rmt = NULL;
     if(p_rmt_obj[channel]->tx_sem == NULL) {
         p_rmt_obj[channel]->tx_sem = xSemaphoreCreateBinary();
         xSemaphoreGive(p_rmt_obj[channel]->tx_sem);
@@ -783,4 +804,68 @@ rmt_tx_end_callback_t rmt_register_tx_end_callback(rmt_tx_end_fn_t function, voi
     rmt_tx_end_callback.function = function;
     rmt_tx_end_callback.arg = arg;
     return previous;
+}
+
+esp_err_t rmt_translator_init(rmt_channel_t channel, sample_to_rmt_t fn)
+{
+    RMT_CHECK(channel < RMT_CHANNEL_MAX, RMT_CHANNEL_ERROR_STR, ESP_ERR_INVALID_ARG);
+    RMT_CHECK(p_rmt_obj[channel] != NULL, RMT_DRIVER_ERROR_STR, ESP_FAIL);
+    const uint32_t block_size = RMT.conf_ch[channel].conf0.mem_size * RMT_MEM_ITEM_NUM * sizeof(rmt_item32_t);
+    if(p_rmt_obj[channel]->tx_buf == NULL) {
+        p_rmt_obj[channel]->tx_buf = (rmt_item32_t *)malloc(block_size);
+        if(p_rmt_obj[channel]->tx_buf == NULL) {
+            ESP_LOGE(RMT_TAG, "RMT translator buffer create fail");
+            return ESP_FAIL;
+        }
+    }
+    if(p_rmt_obj[channel]->tx_thr_sem == NULL) {
+        p_rmt_obj[channel]->tx_thr_sem = xSemaphoreCreateBinary();
+        xSemaphoreGive(p_rmt_obj[channel]->tx_thr_sem);
+    }
+    p_rmt_obj[channel]->sample_to_rmt = fn;
+    ESP_LOGE(RMT_TAG, "RMT translator init done");
+    return ESP_OK;
+}
+
+esp_err_t rmt_write_sample(rmt_channel_t channel, const uint8_t *src, size_t src_size, bool wait_tx_done)
+{
+    RMT_CHECK(channel < RMT_CHANNEL_MAX, RMT_CHANNEL_ERROR_STR, ESP_ERR_INVALID_ARG);
+    RMT_CHECK(p_rmt_obj[channel] != NULL, RMT_DRIVER_ERROR_STR, ESP_FAIL);
+    RMT_CHECK(p_rmt_obj[channel]->sample_to_rmt != NULL,RMT_TRANSLATOR_UNINIT_STR, ESP_FAIL);
+
+    rmt_obj_t* p_rmt = p_rmt_obj[channel];
+    const uint32_t item_block_len = RMT.conf_ch[channel].conf0.mem_size * RMT_MEM_ITEM_NUM;
+    const uint32_t item_sub_len = item_block_len / 2;
+    const uint8_t *psrc = src;
+    size_t item_num = 0;
+    size_t remain_size = src_size;
+    size_t translated_size = 0;
+    xSemaphoreTake(p_rmt->tx_sem, portMAX_DELAY);
+    p_rmt->translator = true;
+    p_rmt->sample_to_rmt((void *)psrc, p_rmt->tx_buf, remain_size, item_block_len, &translated_size, &item_num);
+    remain_size -= translated_size;
+    psrc += translated_size;
+    rmt_fill_memory(channel, p_rmt->tx_buf, item_num, 0);
+    if(item_num == item_block_len){
+        rmt_set_tx_thr_intr_en(channel, 1, item_sub_len);
+        p_rmt->tx_offset = 0;
+        p_rmt->tx_sub_len = item_sub_len;
+    } else {
+        RMTMEM.chan[channel].data32[item_num].val = 0;
+    }
+    rmt_tx_start(channel, true);
+    while(remain_size) {
+        xSemaphoreTake(p_rmt->tx_thr_sem, portMAX_DELAY);
+        p_rmt->sample_to_rmt((void *)psrc, p_rmt->tx_buf, remain_size, item_block_len, &translated_size, &item_num);
+        p_rmt->tx_data = p_rmt->tx_buf;
+        p_rmt->tx_len_rem = item_num;
+        remain_size -= translated_size;
+        psrc += translated_size;
+    }
+    if(wait_tx_done) {
+        xSemaphoreTake(p_rmt->tx_sem, portMAX_DELAY);
+        xSemaphoreGive(p_rmt->tx_sem);
+    }
+    p_rmt->translator = false;
+    return ESP_OK;
 }
